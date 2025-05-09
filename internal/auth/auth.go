@@ -1,6 +1,11 @@
 package auth
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -15,19 +20,17 @@ func HashPassword(password string) (string, error) {
 	}
 	return string(hash), err
 }
-
 func CheckPasswordHash(hash, password string) error {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
 }
-
-func MakeJWT(userID uuid.UUID, tokenSecret string, expiresIn time.Duration) (string, error) {
+func MakeJWT(userID uuid.UUID, tokenSecret string) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
 		Issuer: "chirpy",
 		IssuedAt: &jwt.NumericDate{
 			Time: time.Now(),
 		},
 		ExpiresAt: &jwt.NumericDate{
-			Time: time.Now().Add(expiresIn),
+			Time: time.Now().Add(time.Hour),
 		},
 		Subject: userID.String(),
 	})
@@ -37,7 +40,6 @@ func MakeJWT(userID uuid.UUID, tokenSecret string, expiresIn time.Duration) (str
 	}
 	return signedJWT, nil
 }
-
 func ValidateJWT(tokenString, tokenSecret string) (uuid.UUID, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &jwt.RegisteredClaims{}, func(t *jwt.Token) (interface{}, error) {
 		return []byte(tokenSecret), nil
@@ -54,4 +56,25 @@ func ValidateJWT(tokenString, tokenSecret string) (uuid.UUID, error) {
 		return uuid.UUID{}, err
 	}
 	return userID, err
+}
+func GetBearerToken(headers http.Header) (string, error) {
+	token := headers.Get("Authorization")
+	if token == "" {
+		return "", fmt.Errorf("Error Authorization header was empty")
+	}
+	if !strings.HasPrefix(token, "Bearer ") {
+		return "", fmt.Errorf("Error Authorization header did not contain prefix Bearer")
+	}
+	token = strings.TrimPrefix(token, "Bearer ")
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "", fmt.Errorf("Error Authorization header did not contain a token")
+	}
+	return token, nil
+}
+func MakeRefreshTokenString() (string, error) {
+	tokenInBytes := make([]byte, 32)
+	rand.Read(tokenInBytes)
+	token := hex.EncodeToString(tokenInBytes)
+	return token, nil
 }

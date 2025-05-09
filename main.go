@@ -22,6 +22,7 @@ type apiConfig struct {
 	fileserverHit atomic.Int32
 	queries       *database.Queries
 	platform      string
+	JWTSecret     string
 }
 
 type User struct {
@@ -31,19 +32,18 @@ type User struct {
 	Email     string    `json:"email"`
 }
 
+type UserWithJWT struct {
+	User         User
+	Token        string `json:"token"`
+	RefreshToken string `json:"refresh_token"`
+}
+
 type Chirp struct {
 	ID        uuid.UUID `json:"id"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Body      string    `json:"body"`
 	UserID    uuid.UUID `json:"user_id"`
-}
-
-func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cfg.fileserverHit.Add(1)
-		next.ServeHTTP(w, r)
-	})
 }
 
 func main() {
@@ -57,8 +57,10 @@ func main() {
 	var apiConf apiConfig
 	apiConf.queries = dbQueries
 	apiConf.platform = os.Getenv("PLATFORM")
+	apiConf.JWTSecret = os.Getenv("SECRET")
 	mux := http.NewServeMux()
 	mux.Handle("/app/", http.StripPrefix("/app/", apiConf.middlewareMetricsInc(http.FileServer(http.Dir(".")))))
+
 	mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(200)
@@ -80,7 +82,7 @@ func main() {
 	})
 	mux.HandleFunc("POST /admin/reset", func(w http.ResponseWriter, r *http.Request) {
 		apiConf.fileserverHit.Store(0)
-		err := apiConf.queries.DeleteAllUsers(r.Context())
+		err := dbQueries.DeleteAllUsers(r.Context())
 		if err != nil {
 			log.Printf("Error deleting all users: %s", err)
 			return
@@ -131,13 +133,26 @@ func main() {
 	})
 	mux.HandleFunc("POST /api/chirps", func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
-			Body   string `json:"body"`
-			UserID string `json:"user_id"`
+			Body string `json:"body"`
+		}
+		token, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("Error failed to get bearer token %s\n", err)
+			w.WriteHeader(400)
+			w.Write([]byte("Failed to get bearer token"))
+			return
 		}
 
+		validatedUUID, err := auth.ValidateJWT(token, apiConf.JWTSecret)
+		if err != nil {
+			log.Printf("Error failed to validate jwt %s\n", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Failed to validate jwt token"))
+			return
+		}
 		decoder := json.NewDecoder(r.Body)
 		params := parameters{}
-		err := decoder.Decode(&params)
+		err = decoder.Decode(&params)
 		if err != nil {
 			resp := struct {
 				Error string `json:"error"`
@@ -182,17 +197,17 @@ func main() {
 			w.Write(dat)
 			return
 		}
-		cleanUUID, err := uuid.Parse(params.UserID)
-		if err != nil {
-			log.Printf("Error parsing uuid for chirps: %s", err)
-			return
-		}
+		// cleanUUID, err := uuid.Parse(validatedUUID)
+		// if err != nil {
+		// 	log.Printf("Error parsing uuid for chirps: %s", err)
+		// 	return
+		// }
 
 		cleanChirp := database.CreateChirpParams{
 			Body:   cleanBody(params.Body),
-			UserID: cleanUUID,
+			UserID: validatedUUID,
 		}
-		chirp, err := apiConf.queries.CreateChirp(r.Context(), cleanChirp)
+		chirp, err := dbQueries.CreateChirp(r.Context(), cleanChirp)
 		if err != nil {
 			log.Printf("Error creating chirp: %s", err)
 		}
@@ -246,7 +261,7 @@ func main() {
 			HashedPassword: hashedPass,
 		}
 
-		user, err := apiConf.queries.CreateUser(r.Context(), formatedParams)
+		user, err := dbQueries.CreateUser(r.Context(), formatedParams)
 		if err != nil {
 			log.Printf("Error Creating User: %s", err)
 			w.WriteHeader(500)
@@ -300,11 +315,33 @@ func main() {
 			w.Write([]byte("incorrect email or password"))
 			return
 		}
-		formatedUser := User{
-			ID:        user.ID,
-			CreatedAt: user.CreatedAt,
-			UpdatedAt: user.UpdatedAt,
-			Email:     user.Email,
+		jwtToken, err := auth.MakeJWT(user.ID, apiConf.JWTSecret)
+		if err != nil {
+			w.WriteHeader(500)
+			w.Write([]byte("Failed to make JWT token"))
+			return
+		}
+
+		refreshToken, _ := auth.MakeRefreshTokenString()
+		tokenparams := database.CreateRefreshTokenParams{
+			Token:     refreshToken,
+			ExpiresAt: time.Now().AddDate(0, 0, 60),
+			RevokedAt: sql.NullTime{
+				Valid: false,
+			},
+			UserID: user.ID,
+		}
+
+		dbQueries.CreateRefreshToken(r.Context(), tokenparams)
+		formatedUser := UserWithJWT{
+			User: User{
+				ID:        user.ID,
+				CreatedAt: user.CreatedAt,
+				UpdatedAt: user.UpdatedAt,
+				Email:     user.Email,
+			},
+			Token:        jwtToken,
+			RefreshToken: refreshToken,
 		}
 
 		dat, err := json.Marshal(formatedUser)
@@ -315,7 +352,63 @@ func main() {
 		w.WriteHeader(200)
 		w.Write([]byte(dat))
 	})
+	mux.HandleFunc("POST /api/refresh", func(w http.ResponseWriter, r *http.Request) {
+		bearerToken, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("Error failed to get bearer token %s\n", err)
+			w.WriteHeader(400)
+			w.Write([]byte("Failed to get bearer token"))
+			return
+		}
 
+		refreshToken, err := dbQueries.GetRefreshToken(r.Context(), bearerToken)
+		if err != nil || time.Now().After(refreshToken.ExpiresAt) || refreshToken.RevokedAt.Valid {
+			w.WriteHeader(401)
+			w.Write([]byte("Failed to find refresh token or expired token"))
+			return
+		}
+		user, err := dbQueries.GetUserFromRefreshToken(r.Context(), bearerToken)
+		if err != nil {
+			w.WriteHeader(401)
+			w.Write([]byte("Failed to find user from refresh token"))
+			return
+		}
+		jwtToken, err := auth.MakeJWT(user.ID, apiConf.JWTSecret)
+		if err != nil {
+			w.WriteHeader(500)
+			w.Write([]byte("Failed to make JWT token"))
+			return
+		}
+
+		resp := struct {
+			Token string `json:"token"`
+		}{
+			Token: jwtToken,
+		}
+		dat, err := json.Marshal(resp)
+		if err != nil {
+			log.Printf("Error marshaling JSON: %s", err)
+			w.Write(dat)
+			return
+		}
+		w.WriteHeader(200)
+		w.Write(dat)
+	})
+	mux.HandleFunc("POST /api/revoke", func(w http.ResponseWriter, r *http.Request) {
+		bearerToken, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("Error failed to get bearer token %s\n", err)
+			w.WriteHeader(400)
+			w.Write([]byte("Failed to get bearer token"))
+			return
+		}
+		dbQueries.RevokeRefreshToken(r.Context(), bearerToken)
+		w.WriteHeader(204)
+		return
+
+	})
+
+	// Server Start
 	ServerMux := http.Server{}
 	ServerMux.Handler = mux
 	ServerMux.Addr = ":8080"
@@ -343,4 +436,11 @@ func addTagsToChirp(noTagChirp database.Chirp) Chirp {
 		Body:      noTagChirp.Body,
 		UserID:    noTagChirp.UserID,
 	}
+}
+
+func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg.fileserverHit.Add(1)
+		next.ServeHTTP(w, r)
+	})
 }

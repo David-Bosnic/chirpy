@@ -1,9 +1,11 @@
 package auth
 
 import (
-	"github.com/google/uuid"
+	"net/http"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type baseInput struct {
@@ -82,4 +84,21 @@ func TestJWTCreation(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestGetBearerToken(t *testing.T) {
+	output := "TOKEN_STRING"
+	testHeader := map[string][]string{
+		"Authorization": []string{
+			"Bearer " + output,
+		},
+	}
+	val, err := GetBearerToken(http.Header(testHeader))
+	if err != nil {
+		t.Errorf("Error failed to get bearer token: %s", err)
+	}
+	if val != output {
+		t.Errorf("Bearer token output failed to match expected. Got: %s, Expected: %s", val, output)
+	}
+
 }
