@@ -26,14 +26,16 @@ type apiConfig struct {
 }
 
 type User struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
+	ID          uuid.UUID `json:"id"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	Email       string    `json:"email"`
+	IsChirpyRed bool      `json:"is_chirpy_red"`
 }
 
 type UserWithJWT struct {
 	User         User
+	IsChirpyRed  bool   `json:"is_chirpy_red"`
 	Token        string `json:"token"`
 	RefreshToken string `json:"refresh_token"`
 }
@@ -119,14 +121,19 @@ func main() {
 		chirp, err := dbQueries.GetChirp(r.Context(), parsedID)
 		if err != nil {
 			log.Printf("Error getting single chirp: %s", err)
+			w.WriteHeader(404)
+			w.Write([]byte("Failed to get chirp"))
 			return
 		}
 
 		dat, err := json.Marshal(addTagsToChirp(chirp))
 		if err != nil {
 			log.Printf("Error marsheling single chirp: %s", err)
+			w.WriteHeader(500)
+			w.Write([]byte("Failed to marshel chirp"))
 			return
 		}
+
 		w.WriteHeader(200)
 		w.Write(dat)
 
@@ -268,10 +275,11 @@ func main() {
 			return
 		}
 		formatedUser := User{
-			ID:        user.ID,
-			CreatedAt: user.CreatedAt,
-			UpdatedAt: user.UpdatedAt,
-			Email:     user.Email,
+			ID:          user.ID,
+			CreatedAt:   user.CreatedAt,
+			UpdatedAt:   user.UpdatedAt,
+			Email:       user.Email,
+			IsChirpyRed: user.IsChirpyRed,
 		}
 		dat, err := json.Marshal(formatedUser)
 		if err != nil {
@@ -335,11 +343,13 @@ func main() {
 		dbQueries.CreateRefreshToken(r.Context(), tokenparams)
 		formatedUser := UserWithJWT{
 			User: User{
-				ID:        user.ID,
-				CreatedAt: user.CreatedAt,
-				UpdatedAt: user.UpdatedAt,
-				Email:     user.Email,
+				ID:          user.ID,
+				CreatedAt:   user.CreatedAt,
+				UpdatedAt:   user.UpdatedAt,
+				Email:       user.Email,
+				IsChirpyRed: user.IsChirpyRed,
 			},
+			IsChirpyRed:  user.IsChirpyRed,
 			Token:        jwtToken,
 			RefreshToken: refreshToken,
 		}
@@ -407,8 +417,171 @@ func main() {
 		return
 
 	})
+	mux.HandleFunc("PUT /api/users", func(w http.ResponseWriter, r *http.Request) {
+		type parameters struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
 
-	// Server Start
+		bearerToken, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("Error failed to get bearer token %s\n", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Failed to get bearer token"))
+			return
+		}
+		userId, err := auth.ValidateJWT(bearerToken, apiConf.JWTSecret)
+		if err != nil {
+			log.Printf("Error Failed to validate JWT %s\n", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Failed to validate JWT"))
+			return
+		}
+		decoder := json.NewDecoder(r.Body)
+		params := parameters{}
+		err = decoder.Decode(&params)
+		if err != nil {
+			resp := struct {
+				Error string `json:"error"`
+			}{
+				Error: "Something went wrong",
+			}
+			log.Printf("Error decoding users JSON: %s", err)
+			dat, err := json.Marshal(resp)
+			if err != nil {
+				log.Printf("Error marshaling users JSON: %s", err)
+				w.Write(dat)
+				return
+			}
+		}
+
+		hashedPass, err := auth.HashPassword(params.Password)
+		if err != nil {
+			w.WriteHeader(500)
+			log.Printf("Error hashing password: %s", err)
+			return
+		}
+		formatedRequest := database.UpdateUserEmailAndPasswordParams{
+			Email:          params.Email,
+			HashedPassword: hashedPass,
+			ID:             userId,
+		}
+		err = dbQueries.UpdateUserEmailAndPassword(r.Context(), formatedRequest)
+		if err != nil {
+			w.WriteHeader(500)
+			log.Printf("Error updating user email and password: %s", err)
+			return
+		}
+		user, err := dbQueries.GetUserByEmail(r.Context(), params.Email)
+		if err != nil {
+			w.WriteHeader(500)
+			log.Printf("Error getting user: %s", err)
+			return
+		}
+		resp := User{
+			ID:          user.ID,
+			CreatedAt:   user.CreatedAt,
+			UpdatedAt:   user.UpdatedAt,
+			Email:       user.Email,
+			IsChirpyRed: user.IsChirpyRed,
+		}
+
+		dat, err := json.Marshal(resp)
+		if err != nil {
+			log.Printf("Error marshaling JSON: %s", err)
+			return
+		}
+		w.WriteHeader(200)
+		w.Write(dat)
+		return
+	})
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("chirpID")
+		parsedID, err := uuid.Parse(id)
+		if err != nil {
+			log.Printf("Error parsing GET chirps id: %s", err)
+			return
+		}
+		bearerToken, err := auth.GetBearerToken(r.Header)
+		if err != nil {
+			log.Printf("Error failed to get bearer token %s\n", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Failed to get bearer token"))
+			return
+		}
+		userId, err := auth.ValidateJWT(bearerToken, apiConf.JWTSecret)
+		if err != nil {
+			log.Printf("Error Failed to validate JWT %s\n", err)
+			w.WriteHeader(403)
+			w.Write([]byte("Failed to validate JWT"))
+			return
+		}
+		currentChirp, err := dbQueries.GetChirp(r.Context(), parsedID)
+		if err != nil {
+			w.WriteHeader(404)
+			w.Write([]byte("Chirp does not exist"))
+			return
+		}
+		if currentChirp.UserID != userId {
+			w.WriteHeader(403)
+			w.Write([]byte("Error User id and chirp owner do not match"))
+			return
+		}
+		err = dbQueries.DeleteChirp(r.Context(), currentChirp.ID)
+		if err != nil {
+			log.Printf("Failed to delete chirp")
+			w.WriteHeader(404)
+			w.Write([]byte("Chirp was not found"))
+			return
+		}
+		w.WriteHeader(204)
+	})
+	mux.HandleFunc("POST /api/polka/webhooks", func(w http.ResponseWriter, r *http.Request) {
+		type parameters struct {
+			Event string `json:"event"`
+			Data  struct {
+				UserID string `json:"user_id"`
+			} `json:"data"`
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		params := parameters{}
+		err := decoder.Decode(&params)
+		if err != nil {
+			resp := struct {
+				Error string `json:"error"`
+			}{
+				Error: "Something went wrong",
+			}
+			log.Printf("Error decoding users JSON: %s", err)
+			dat, err := json.Marshal(resp)
+			if err != nil {
+				log.Printf("Error marshaling users JSON: %s", err)
+				w.Write(dat)
+				return
+			}
+		}
+		if params.Event != "user.upgraded" {
+			log.Printf("Error event was not 'user.upgraded'")
+			w.WriteHeader(204)
+			return
+		}
+		parsedID, err := uuid.Parse(params.Data.UserID)
+		if err != nil {
+			w.WriteHeader(400)
+			w.Write([]byte("Error parsing userID"))
+			return
+		}
+		err = dbQueries.UpdateToChirpyRed(r.Context(), parsedID)
+		if err != nil {
+			w.WriteHeader(404)
+			w.Write([]byte("User not found to Update to Chirpy Red"))
+			return
+		}
+		w.WriteHeader(204)
+		return
+
+	})
 	ServerMux := http.Server{}
 	ServerMux.Handler = mux
 	ServerMux.Addr = ":8080"

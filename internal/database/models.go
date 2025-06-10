@@ -34,4 +34,5 @@ type User struct {
 	UpdatedAt      time.Time
 	HashedPassword string
 	Email          string
+	IsChirpyRed    bool
 }
