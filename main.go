@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -34,8 +35,7 @@ type User struct {
 }
 
 type UserWithJWT struct {
-	User         User
-	IsChirpyRed  bool   `json:"is_chirpy_red"`
+	User
 	Token        string `json:"token"`
 	RefreshToken string `json:"refresh_token"`
 }
@@ -93,7 +93,21 @@ func main() {
 		w.WriteHeader(200)
 	})
 	mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
-		untaggedChirps, err := dbQueries.ListChirps(r.Context())
+		s := r.URL.Query().Get("author_id")
+		var parsedID uuid.UUID
+		if s != "" {
+			parsedID, err = uuid.Parse(s)
+			if err != nil {
+				log.Printf("Error parsing GET chirps id: %s", err)
+				return
+			}
+		}
+		var untaggedChirps []database.Chirp
+		if s != "" {
+			untaggedChirps, err = dbQueries.ListChirpsFromAuthorID(r.Context(), parsedID)
+		} else {
+			untaggedChirps, err = dbQueries.ListChirps(r.Context())
+		}
 		if err != nil {
 			log.Printf("Error getting all chirps: %s", err)
 			return
@@ -101,6 +115,13 @@ func main() {
 		taggedChirps := []Chirp{}
 		for _, untaggedChirp := range untaggedChirps {
 			taggedChirps = append(taggedChirps, addTagsToChirp(untaggedChirp))
+		}
+
+		sortType := r.URL.Query().Get("sort")
+		if sortType == "asc" {
+			sort.Slice(taggedChirps, func(i, j int) bool { return taggedChirps[i].CreatedAt.Before(taggedChirps[j].CreatedAt) })
+		} else if sortType == "desc" {
+			sort.Slice(taggedChirps, func(i, j int) bool { return taggedChirps[i].CreatedAt.After(taggedChirps[j].CreatedAt) })
 		}
 		dat, err := json.Marshal(taggedChirps)
 		if err != nil {
@@ -349,7 +370,6 @@ func main() {
 				Email:       user.Email,
 				IsChirpyRed: user.IsChirpyRed,
 			},
-			IsChirpyRed:  user.IsChirpyRed,
 			Token:        jwtToken,
 			RefreshToken: refreshToken,
 		}
@@ -547,6 +567,20 @@ func main() {
 		decoder := json.NewDecoder(r.Body)
 		params := parameters{}
 		err := decoder.Decode(&params)
+		apikey, err := auth.GetApiKey(r.Header)
+		if err != nil {
+			log.Printf("Error failed to get Api Key token %s\n", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Failed to get Api Key"))
+			return
+		}
+		polkaKey := os.Getenv("POLKA_KEY")
+		if apikey != polkaKey {
+			log.Printf("Error Api key did not match: %s\n", err)
+			w.WriteHeader(401)
+			w.Write([]byte("Api key did not match"))
+			return
+		}
 		if err != nil {
 			resp := struct {
 				Error string `json:"error"`
